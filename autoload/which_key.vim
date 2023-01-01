@@ -9,13 +9,36 @@ let s:TYPE = {
       \ 'string':  type(''),
       \ 'funcref': type(function('call'))
       \ }
+" For the purpose of mapping a keypress to internal data-structures
+let s:KEYCODES = {
+      \ "\<BS>": '<BS>',
+      \ "\<Tab>": '<Tab>',
+      \ "\<CR>": '<CR>',
+      \ "\<Esc>": '<Esc>',
+      \ "\<Del>": '<Del>'
+      \ }
+" For the purposes of merging identical keycodes in internal data-structures
+let s:MERGE_INTO = {
+      \ '<Space>': ' ',
+      \ '<C-H>': '<BS>',
+      \ '<C-I>': '<Tab>',
+      \ '<C-M>': '<CR>',
+      \ '<Return>': '<CR>',
+      \ '<Enter>': '<CR>',
+      \ '<C-[>': '<Esc>',
+      \ '<lt>': '<',
+      \ '<Bslash>': '\',
+      \ '<Bar>': '|'
+      \ }
+let s:REQUIRES_REGEX_ESCAPE = ['$', '*', '~', '.']
+
 let g:which_key#TYPE = s:TYPE
 
 let s:should_note_winid = exists('*win_getid')
 
 function! which_key#register(prefix, dict, ...) abort
-  let key = a:prefix ==? '<Space>' ? ' ' :
-    \ (a:prefix ==? '<C-I>' ? '<Tab>' : a:prefix)
+  let key = has_key(s:MERGE_INTO, a:prefix) ?
+    \ s:MERGE_INTO[a:prefix] : a:prefix
   let val = a:dict
   if a:0 == 1
     call extend(s:desc[a:1], {key:val})
@@ -30,14 +53,19 @@ function! s:handle_char_on_start_is_ok(c) abort
   if which_key#char_handler#is_exit_code(a:c)
     return 1
   endif
-  let char = a:c == 9 ? '<Tab>' : nr2char(a:c)
-  let s:which_key_trigger .= ' '.char
+  let char = type(a:c) == s:TYPE.number ? nr2char(a:c) : a:c
+  if has_key(s:KEYCODES, char)
+    let char = s:KEYCODES[char]
+  endif
+  let s:which_key_trigger .= ' '.(char ==# ' ' ? '<Space>' : char)
   let next_level = get(s:runtime, char)
   let ty = type(next_level)
   if ty == s:TYPE.dict
     let s:runtime = next_level
     return 0
-  elseif ty == s:TYPE.list
+  elseif ty == s:TYPE.list && (!g:which_key_fallback_to_native_key ||
+    \ g:which_key_fallback_to_native_key &&
+    \ next_level[0] !=# 'which_key#error#missing_mapping()')
     call s:execute(next_level[0])
     return 1
   elseif g:which_key_fallback_to_native_key
@@ -52,6 +80,7 @@ endfunction
 function! which_key#start(vis, bang, prefix) " {{{
   let s:vis = a:vis ? 'gv' : ''
   let mode = a:vis ? 'v' : 'n'
+  let prefix = a:prefix
   let s:count = v:count != 0 ? v:count : ''
   let s:which_key_trigger = ''
 
@@ -60,15 +89,20 @@ function! which_key#start(vis, bang, prefix) " {{{
   endif
 
   if a:bang
-    for kv in keys(a:prefix)
+    for kv in keys(prefix)
       call s:cache_key(mode, kv)
     endfor
-    let s:runtime = deepcopy(a:prefix)
+    let s:runtime = deepcopy(prefix)
     call s:merge(s:runtime, s:cache[mode])
   else
-    let key = a:prefix ==? '<Space>' ? ' ' :
-      \ (a:prefix ==? '<C-I>' ? '<Tab>' : a:prefix)
-    let s:which_key_trigger = key ==# ' ' ? '<space>' : key
+    if has_key(s:KEYCODES, prefix)
+      let prefix = s:KEYCODES[prefix]
+    endif
+    if has_key(s:MERGE_INTO, prefix)
+      let prefix = s:MERGE_INTO[prefix]
+    endif
+    let key = prefix
+    let s:which_key_trigger = key ==# ' ' ? '<Space>' : key
     call s:cache_key(mode, key)
 
     " s:runtime is a dictionary combining the native key mapping dictionary
@@ -127,23 +161,14 @@ endfunction
 function! s:merge(target, native) " {{{
   let target = a:target
   let native = a:native
-  " <C-І> is merged into <Tab>, '<Space>' is merged into ' '
-  if has_key(target, '<C-I>')
-    if has_key(target, '<Tab>')
-      call extend(target['<Tab>'], target['<C-I>'], 'keep')
-    else
-      let target['<Tab>'] = target['<C-I>']
-    endif
-    call remove(target, '<C-I>')
-  endif
-  if has_key(target, '<Space>')
-    if has_key(target, ' ')
-      call extend(target[' '], target['<Space>'], 'keep')
-    else
-      let target[' '] = target['<Space>']
-    endif
-    call remove(target, '<Space>')
-  endif
+  " e.g. <C-І> is merged into <Tab>, '<Space>' is merged into ' '
+  call map(target, {k,v ->
+  \ has_key(s:MERGE_INTO, k) ?
+  \   (has_key(target, s:MERGE_INTO[k]) ?
+  \     extend(target[s:MERGE_INTO[k]], target[k], 'keep') :
+  \     extend(target, {s:MERGE_INTO[k]: target[k]})) :
+  \   v})
+  call filter(target, {k,_ -> !has_key(s:MERGE_INTO, k)})
   for [k, V] in items(target)
     " Support a `Dictionary-function` for on-the-fly mappings
     while type(target[k]) == s:TYPE.funcref
@@ -191,15 +216,10 @@ function! s:echo_prompt() abort
 endfunction
 
 function! s:has_children(input) abort
-  " TODO: escape properly, E114: Missing quote: "^\"
-  if a:input ==# '\'
-    let group = map(keys(s:runtime), 'v:val =~# "^\'.a:input.'"')
-  elseif a:input ==# '"'
-    let group = map(keys(s:runtime), "v:val =~# '^".a:input."'")
-  elseif a:input == '.'
-    let group = map(keys(s:runtime), "v:val =~# '^\\.'")
+  if index(s:REQUIRES_REGEX_ESCAPE, a:input) != -1
+    let group = map(keys(s:runtime), {_,v -> v =~# '^\'.a:input})
   else
-    let group = map(keys(s:runtime), 'v:val =~# "^'.a:input.'"')
+    let group = map(keys(s:runtime), {_,v -> v =~# '^'.a:input})
   endif
   return len(filter(group, 'v:val == 1')) > 1
 endfunction
@@ -241,7 +261,7 @@ function! s:getchar() abort
   endif
 
   " Allow <BS> to go back to the upper level.
-  if c ==# "\<BS>"
+  if c == "\<BS>"
     call s:show_upper_level_mappings()
     return ''
   endif
@@ -262,7 +282,6 @@ function! s:getchar() abort
       endif
     endwhile
   endif
-
   return input
 endfunction
 
@@ -287,7 +306,7 @@ function! which_key#wait_for_input() " {{{
 endfunction
 
 function! s:show_next_level_mappings(next_runtime) abort
-  let s:which_key_trigger .= ' '. (s:cur_char ==# ' ' ? '<space>' : s:cur_char)
+  let s:which_key_trigger .= ' '.(s:cur_char ==# ' ' ? '<Space>' : s:cur_char)
   call add(s:last_runtime_stack, copy(s:runtime))
   let s:runtime = a:next_runtime
   call which_key#window#show(s:runtime)
@@ -296,12 +315,14 @@ endfunction
 function! s:handle_input(input) " {{{
   let ty = type(a:input)
 
-  if ty ==? s:TYPE.dict
+  if ty == s:TYPE.dict
     call s:show_next_level_mappings(a:input)
     return
   endif
 
-  if ty ==? s:TYPE.list
+  if ty == s:TYPE.list && (!g:which_key_fallback_to_native_key ||
+    \ g:which_key_fallback_to_native_key &&
+    \ a:input[0] !=# 'which_key#error#missing_mapping()')
     call which_key#window#close()
     call s:execute(a:input[0])
   elseif g:which_key_fallback_to_native_key
@@ -322,7 +343,7 @@ endfunction
 
 function! s:execute_native_fallback(append) abort
   let l:reg = s:get_register()
-  let l:fallback_cmd = s:vis.l:reg.s:count.substitute(s:which_key_trigger, ' ', '', '')
+  let l:fallback_cmd = s:vis.l:reg.s:count.substitute(substitute(s:which_key_trigger, ' ', '', 'g'), '<Space>', ' ', 'g')
   if (a:append)
     let l:fallback_cmd = l:fallback_cmd.get(s:, 'cur_char', '')
   endif
@@ -354,7 +375,9 @@ function! s:execute(cmd) abort
     elseif Cmd =~? '.(*)$' && match(Cmd, '\<call\>') == -1
       let Cmd = s:join('call', Cmd)
     elseif exists(':'.Cmd)  || Cmd =~# '^:' || Cmd =~? '^call feedkeys(.*)$'
-      let Cmd = Cmd
+      if !empty(s:vis)
+        let Cmd = line('v').','.line('.').Cmd
+      endif
     else
       let Cmd = s:join('call', 'feedkeys("'.Cmd.'")')
     endif
